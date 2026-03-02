@@ -9,12 +9,12 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/samsonchoi/feishu-claude-bot/venv/bin/python3</string>
-        <string>/Users/samsonchoi/feishu-claude-bot/bot.py</string>
+        <string>/Users/samsonchoi/Desktop/AI_Workspace/feishu-claude-bot/venv/bin/python3</string>
+        <string>/Users/samsonchoi/Desktop/AI_Workspace/feishu-claude-bot/bot_v2.py</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/samsonchoi/feishu-claude-bot</string>
+    <string>/Users/samsonchoi/Desktop/AI_Workspace/feishu-claude-bot</string>
 
     <!-- 登录后自动启动 -->
     <key>RunAtLoad</key>
@@ -26,10 +26,10 @@
 
     <!-- 日志路径 -->
     <key>StandardOutPath</key>
-    <string>/Users/samsonchoi/feishu-claude-bot/bot.log</string>
+    <string>/Users/samsonchoi/Desktop/AI_Workspace/feishu-claude-bot/bot.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/samsonchoi/feishu-claude-bot/bot.error.log</string>
+    <string>/Users/samsonchoi/Desktop/AI_Workspace/feishu-claude-bot/bot.error.log</string>
 
     <!-- 环境变量（确保能找到 claude 命令）-->
     <key>EnvironmentVariables</key>

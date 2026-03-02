@@ -1,0 +1,79 @@
+#!/usr/bin/expect -f
+# 测试使用 expect 来与 Claude Code 交互 - 改进版
+
+set timeout 180
+set env(CLAUDECODE) ""
+
+# 启用详细日志
+log_user 1
+exp_internal 0
+
+# 启动 Claude Code
+spawn /Users/samsonchoi/.local/bin/claude --dangerously-skip-permissions
+
+# 处理安全提示
+expect {
+    -re ".*accept.*" {
+        puts "\n=== 检测到 accept 提示，发送 2 ==="
+        send "2\r"
+    }
+    -re ".*trust.*" {
+        puts "\n=== 检测到 trust 提示，发送 Enter ==="
+        send "\r"
+        exp_continue
+    }
+    timeout {
+        puts "\n=== 等待提示超时 ==="
+        exit 1
+    }
+}
+
+# 等待 Claude Code 完全启动（等待提示符或任何输出）
+puts "\n=== 等待 Claude Code 启动完成 ==="
+sleep 8
+
+puts "\n=== 发送问题: 1+1等于几 ==="
+send "1+1等于几\r"
+
+# 使用更智能的方式等待响应
+puts "\n=== 等待响应... ==="
+set response_complete 0
+set idle_count 0
+
+# 循环读取输出，直到连续3秒没有新输出
+for {set i 0} {$i < 60} {incr i} {
+    expect {
+        -re ".+" {
+            # 收到输出，重置空闲计数
+            set idle_count 0
+        }
+        timeout {
+            # 1秒超时，增加空闲计数
+            incr idle_count
+            if {$idle_count >= 3} {
+                puts "\n=== 3秒无新输出，认为响应完成 ==="
+                set response_complete 1
+                break
+            }
+        }
+    }
+}
+
+if {$response_complete == 0} {
+    puts "\n=== 等待响应超时 ==="
+}
+
+puts "\n=== 发送退出命令 ==="
+send "exit\r"
+
+# 等待进程结束
+expect {
+    eof {
+        puts "\n=== Claude Code 已退出 ==="
+    }
+    timeout {
+        puts "\n=== 等待退出超时 ==="
+    }
+}
+
+puts "\n=== 测试完成 ==="

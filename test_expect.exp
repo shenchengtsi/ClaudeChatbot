@@ -1,0 +1,44 @@
+#!/usr/bin/expect -f
+# 测试使用 expect 来与 Claude Code 交互
+
+set timeout 120
+set env(CLAUDECODE) ""
+
+log_user 1
+
+# 启动 Claude Code
+spawn /Users/samsonchoi/.local/bin/claude --dangerously-skip-permissions
+
+# 等待任何提示出现（使用更宽松的匹配）
+expect {
+    -re ".*accept.*" {
+        puts "\n=== 检测到 accept 提示，发送 2 ==="
+        send "2\r"
+    }
+    -re ".*trust.*" {
+        puts "\n=== 检测到 trust 提示，发送 Enter ==="
+        send "\r"
+        exp_continue
+    }
+    timeout {
+        puts "\n=== 等待提示超时 ==="
+        exit 1
+    }
+}
+
+# 等待 Claude Code 准备就绪
+sleep 5
+
+puts "\n=== 发送问题: 1+1等于几 ==="
+send "1+1等于几\r"
+
+# 等待响应完成
+sleep 20
+
+puts "\n=== 发送退出命令 ==="
+send "exit\r"
+
+# 等待进程结束
+expect eof
+
+puts "\n=== 测试完成 ==="
