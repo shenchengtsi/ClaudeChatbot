@@ -1,1 +1,2 @@
 lark-oapi>=1.3.0
+pexpect
