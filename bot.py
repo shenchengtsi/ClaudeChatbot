@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+飞书 Claude Code Bot
+通过飞书消息远程控制 Mac Mini 上的 Claude Code
+"""
+
+import json
+import subprocess
+import threading
+import logging
+import os
+import signal
+import sys
+import time
+import pty
+import select
+from datetime import datetime
+from collections import defaultdict
+
+import lark_oapi as lark
+from lark_oapi.api.im.v1 import *
+
+# ========== 加载配置 ==========
+from config import APP_ID, APP_SECRET, ALLOWED_OPEN_IDS, WORK_DIR, CLAUDE_PATH, MAX_OUTPUT_LEN, TIMEOUT
+
+# ========== 日志配置 ==========
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("bot.log", encoding="utf-8"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+log = logging.getLogger(__name__)
+
+# ========== 飞书客户端 ==========
+feishu_client = lark.Client.builder() \
+    .app_id(APP_ID) \
+    .app_secret(APP_SECRET) \
+    .build()
+
+# ========== Session 管理 ==========
+class ClaudeSession:
+    """管理单个 Claude Code 交互式会话"""
+    def __init__(self, chat_id: str):
+        self.chat_id = chat_id
+        self.process = None
+        self.master_fd = None
+        self.last_activity = time.time()
+        self.lock = threading.Lock()
+        self.start_session()
+
+    def start_session(self):
+        """启动 Claude Code 交互式会话"""
+        try:
+            env = {**os.environ, "TERM": "xterm-256color", "CLAUDECODE": ""}
+            master_fd, slave_fd = pty.openpty()
+
+            self.process = subprocess.Popen(
+                [CLAUDE_PATH],
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                cwd=WORK_DIR,
+                env=env,
+                preexec_fn=os.setsid
+            )
+
+            os.close(slave_fd)
+            self.master_fd = master_fd
+
+            # 等待 Claude Code 启动完成
+            time.sleep(2)
+            self._read_output(timeout=1)
+
+            log.info(f"为 chat_id={self.chat_id} 创建新 session (pid={self.process.pid})")
+        except Exception as e:
+            log.error(f"启动 session 失败: {e}")
+            raise
+
+    def send_message(self, text: str) -> str:
+        """发送消息到 Claude Code 并获取响应"""
+        with self.lock:
+            try:
+                self.last_activity = time.time()
+
+                # 发送消息
+                os.write(self.master_fd, (text + "\n").encode())
+
+                # 读取响应
+                time.sleep(0.5)
+                output = self._read_output(timeout=TIMEOUT)
+
+                # 清理输出
+                output = self._clean_output(output)
+
+                if len(output) > MAX_OUTPUT_LEN:
+                    output = output[:MAX_OUTPUT_LEN] + f"\n\n⚠️ 输出过长，已截断（共{len(output)}字符）"
+
+                return output if output else "（命令执行完成，无输出）"
+
+            except Exception as e:
+                log.error(f"发送消息失败: {e}")
+                return f"❌ 执行出错：{str(e)}"
+
+    def _read_output(self, timeout=30) -> str:
+        """读取 Claude Code 输出"""
+        output = []
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            if select.select([self.master_fd], [], [], 0.1)[0]:
+                try:
+                    data = os.read(self.master_fd, 4096).decode('utf-8', errors='ignore')
+                    if data:
+                        output.append(data)
+                except OSError:
+                    break
+            else:
+                # 如果已经有输出且停止接收，认为完成
+                if output and time.time() - start_time > 1:
+                    break
+
+        return ''.join(output)
+
+    def _clean_output(self, text: str) -> str:
+        """清理输出文本"""
+        import re
+        # 移除 ANSI 控制字符
+        ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+        text = ansi_escape.sub('', text)
+
+        # 移除输入回显
+        lines = text.split('\n')
+        cleaned_lines = []
+        skip_next = False
+
+        for line in lines:
+            if skip_next:
+                skip_next = False
+                continue
+            # 跳过空行和提示符
+            if line.strip() and not line.strip().startswith('>'):
+                cleaned_lines.append(line)
+
+        return '\n'.join(cleaned_lines).strip()
+
+    def close(self):
+        """关闭会话"""
+        try:
+            if self.process:
+                os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+                self.process.wait(timeout=5)
+            if self.master_fd:
+                os.close(self.master_fd)
+            log.info(f"关闭 session for chat_id={self.chat_id}")
+        except Exception as e:
+            log.error(f"关闭 session 失败: {e}")
+
+    def is_alive(self) -> bool:
+        """检查会话是否存活"""
+        return self.process and self.process.poll() is None
+
+
+class SessionManager:
+    """管理所有聊天的 Claude Code 会话"""
+    def __init__(self):
+        self.sessions = {}
+        self.lock = threading.Lock()
+        # 启动清理线程
+        self.cleanup_thread = threading.Thread(target=self._cleanup_inactive_sessions, daemon=True)
+        self.cleanup_thread.start()
+
+    def get_session(self, chat_id: str) -> ClaudeSession:
+        """获取或创建会话"""
+        with self.lock:
+            if chat_id not in self.sessions or not self.sessions[chat_id].is_alive():
+                if chat_id in self.sessions:
+                    self.sessions[chat_id].close()
+                self.sessions[chat_id] = ClaudeSession(chat_id)
+            return self.sessions[chat_id]
+
+    def close_session(self, chat_id: str):
+        """关闭指定会话"""
+        with self.lock:
+            if chat_id in self.sessions:
+                self.sessions[chat_id].close()
+                del self.sessions[chat_id]
+
+    def _cleanup_inactive_sessions(self):
+        """定期清理不活跃的会话（30分钟无活动）"""
+        while True:
+            time.sleep(300)  # 每5分钟检查一次
+            with self.lock:
+                inactive_chats = []
+                for chat_id, session in self.sessions.items():
+                    if time.time() - session.last_activity > 1800:  # 30分钟
+                        inactive_chats.append(chat_id)
+
+                for chat_id in inactive_chats:
+                    log.info(f"清理不活跃 session: {chat_id}")
+                    self.sessions[chat_id].close()
+                    del self.sessions[chat_id]
+
+# 全局 session 管理器
+session_manager = SessionManager()
+
+
+# ========== 工具函数 ==========
+
+def send_message(chat_id: str, text: str):
+    """发送文本消息到飞书"""
+    try:
+        request = CreateMessageRequest.builder() \
+            .receive_id_type("chat_id") \
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(chat_id)
+                .msg_type("text")
+                .content(json.dumps({"text": text}, ensure_ascii=False))
+                .build()
+            ).build()
+        resp = feishu_client.im.v1.message.create(request)
+        if not resp.success():
+            log.error(f"发送消息失败: {resp.msg}")
+    except Exception as e:
+        log.error(f"send_message 异常: {e}")
+
+
+def reply_message(msg_id: str, text: str):
+    """回复消息（引用原消息）"""
+    try:
+        request = ReplyMessageRequest.builder() \
+            .message_id(msg_id) \
+            .request_body(
+                ReplyMessageRequestBody.builder()
+                .msg_type("text")
+                .content(json.dumps({"text": text}, ensure_ascii=False))
+                .build()
+            ).build()
+        resp = feishu_client.im.v1.message.reply(request)
+        if not resp.success():
+            log.error(f"回复消息失败: {resp.msg}")
+    except Exception as e:
+        log.error(f"reply_message 异常: {e}")
+
+
+def add_reaction(msg_id: str, emoji_type: str = "FOLDED_HANDS"):
+    """给消息添加表情回应"""
+    try:
+        from lark_oapi.api.im.v1 import CreateMessageReactionRequest, CreateMessageReactionRequestBody, Emoji
+        request = CreateMessageReactionRequest.builder() \
+            .message_id(msg_id) \
+            .request_body(
+                CreateMessageReactionRequestBody.builder()
+                .reaction_type(Emoji.builder().emoji_type(emoji_type).build())
+                .build()
+            ).build()
+        resp = feishu_client.im.v1.message_reaction.create(request)
+        if not resp.success():
+            log.error(f"添加表情失败: {resp.msg}")
+    except Exception as e:
+        log.error(f"add_reaction 异常: {e}")
+
+
+def is_allowed(open_id: str) -> bool:
+    """检查用户是否有权限"""
+    if not ALLOWED_OPEN_IDS:
+        # 未配置白名单则允许所有人（不推荐）
+        log.warning("⚠️ 未配置 ALLOWED_OPEN_IDS，所有用户均可使用！")
+        return True
+    return open_id in ALLOWED_OPEN_IDS
+
+
+def clean_text(text: str) -> str:
+    """清理消息文本，移除@机器人的部分"""
+    import re
+    # 移除 @xxx 格式
+    text = re.sub(r'@\S+', '', text).strip()
+    return text
+
+
+# ========== 消息处理 ==========
+
+def handle_message_event(data):
+    """处理飞书消息事件"""
+    try:
+        # 处理飞书事件对象
+        if hasattr(data, 'event'):
+            event = data.event
+            message = event.message if hasattr(event, 'message') else {}
+            sender = event.sender if hasattr(event, 'sender') else {}
+        else:
+            raw = data.to_dict() if hasattr(data, 'to_dict') else data
+            event = raw.get("event", {})
+            message = event.get("message", {})
+            sender = event.get("sender", {})
+
+        # 获取消息信息
+        if hasattr(message, 'message_type'):
+            # 对象模式
+            sender_open_id = sender.sender_id.open_id if hasattr(sender, 'sender_id') else ""
+            msg_type = message.message_type if hasattr(message, 'message_type') else ""
+            chat_id = message.chat_id if hasattr(message, 'chat_id') else ""
+            msg_id = message.message_id if hasattr(message, 'message_id') else ""
+            content_str = message.content if hasattr(message, 'content') else "{}"
+        else:
+            # 字典模式
+            sender_open_id = sender.get("sender_id", {}).get("open_id", "")
+            msg_type = message.get("message_type", "")
+            chat_id = message.get("chat_id", "")
+            msg_id = message.get("message_id", "")
+            content_str = message.get("content", "{}")
+
+        log.info(f"收到消息 | sender={sender_open_id} | type={msg_type} | chat={chat_id}")
+
+        # 权限校验
+        if not is_allowed(sender_open_id):
+            log.warning(f"拒绝未授权用户: {sender_open_id}")
+            send_message(chat_id, "🚫 你没有权限使用此机器人")
+            return
+
+        # 只处理文本消息
+        if msg_type != "text":
+            send_message(chat_id, "⚠️ 目前只支持文本命令，请发送文字指令")
+            return
+
+        content = json.loads(content_str)
+        text = content.get("text", "").strip()
+        text = clean_text(text)
+
+        if not text:
+            return
+
+        # 处理特殊指令
+        if text in ["/help", "帮助", "help"]:
+            send_message(chat_id, HELP_TEXT)
+            return
+
+        if text in ["/pwd", "当前目录"]:
+            send_message(chat_id, f"📁 当前工作目录：\n{WORK_DIR}")
+            return
+
+        if text.startswith("/cd "):
+            new_dir = text[4:].strip()
+            handle_cd(chat_id, new_dir)
+            return
+
+        if text in ["/status", "状态"]:
+            status_text = get_status()
+            status_text += f"\n💬 活跃会话数：{len(session_manager.sessions)}"
+            send_message(chat_id, status_text)
+            return
+
+        if text in ["/reset", "重置会话"]:
+            session_manager.close_session(chat_id)
+            send_message(chat_id, "✅ 会话已重置，下次对话将创建新的 session")
+            return
+
+        # 添加思考表情表示已读
+        add_reaction(msg_id, "THINKING")
+
+        # 在新线程中执行，避免阻塞事件循环
+        def execute():
+            try:
+                session = session_manager.get_session(chat_id)
+                result = session.send_message(text)
+                reply_message(msg_id, result)
+            except Exception as e:
+                log.error(f"执行失败: {e}", exc_info=True)
+                reply_message(msg_id, f"❌ 执行出错：{str(e)}")
+
+        t = threading.Thread(target=execute, daemon=True)
+        t.start()
+
+    except Exception as e:
+        log.error(f"handle_message_event 异常: {e}", exc_info=True)
+
+
+def handle_cd(chat_id: str, new_dir: str):
+    """处理切换目录指令"""
+    global WORK_DIR
+    expanded = os.path.expanduser(new_dir)
+    if os.path.isdir(expanded):
+        WORK_DIR = expanded
+        send_message(chat_id, f"✅ 已切换工作目录：\n{WORK_DIR}")
+    else:
+        send_message(chat_id, f"❌ 目录不存在：{expanded}")
+
+
+def get_status() -> str:
+    """获取当前状态信息"""
+    return (
+        f"📊 Bot 状态\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"🟢 运行中\n"
+        f"📁 工作目录：{WORK_DIR}\n"
+        f"🤖 Claude 路径：{CLAUDE_PATH}\n"
+        f"⏱ 超时设置：{TIMEOUT}s\n"
+        f"🕐 当前时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
+
+HELP_TEXT = """
+🤖 飞书 Claude Code Bot 使用说明
+━━━━━━━━━━━━━━━━━━━━
+
+📌 直接发送任何指令，Claude Code 会在你的 Mac Mini 上执行
+💡 每个聊天（私聊/群聊）都有独立的对话上下文
+
+📋 内置命令：
+  /help      - 显示此帮助
+  /pwd       - 查看当前工作目录
+  /cd <路径> - 切换工作目录
+  /status    - 查看 Bot 状态
+  /reset     - 重置当前会话（清除对话历史）
+
+💡 示例指令：
+  帮我写一个 Python 爬虫，保存到 ~/Desktop/crawler.py
+  解释一下 ~/project/main.py 这个文件
+  在当前目录创建一个 README.md
+  列出 ~/Desktop 下所有 .py 文件
+
+⚠️ 注意：
+  - 所有操作都在 Mac Mini 本地执行
+  - 每个聊天有独立的 Claude Code 会话
+  - 会话会记住之前的对话内容
+  - 30分钟无活动会自动清理会话
+""".strip()
+
+
+# ========== 主程序 ==========
+
+def main():
+    log.info("=" * 50)
+    log.info("🚀 飞书 Claude Code Bot 启动")
+    log.info(f"📁 工作目录: {WORK_DIR}")
+    log.info(f"🤖 Claude 路径: {CLAUDE_PATH}")
+    log.info(f"👥 授权用户数: {len(ALLOWED_OPEN_IDS)}")
+    log.info("=" * 50)
+
+    # 构建事件处理器
+    event_handler = lark.EventDispatcherHandler.builder("", "") \
+        .register_p2_im_message_receive_v1(handle_message_event) \
+        .build()
+
+    # 使用 WebSocket 长连接（无需公网 IP）
+    ws_client = lark.ws.Client(
+        APP_ID,
+        APP_SECRET,
+        event_handler=event_handler,
+        log_level=lark.LogLevel.INFO
+    )
+
+    def shutdown(sig, frame):
+        log.info("收到退出信号，正在关闭...")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    ws_client.start()
+
+
+if __name__ == "__main__":
+    main()

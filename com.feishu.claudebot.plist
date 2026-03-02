@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- 修改下面两处 YOUR_USERNAME 为你的 Mac 用户名 -->
+
+    <key>Label</key>
+    <string>com.feishu.claudebot</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/samsonchoi/feishu-claude-bot/venv/bin/python3</string>
+        <string>/Users/samsonchoi/feishu-claude-bot/bot.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/samsonchoi/feishu-claude-bot</string>
+
+    <!-- 登录后自动启动 -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- 崩溃后自动重启 -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- 日志路径 -->
+    <key>StandardOutPath</key>
+    <string>/Users/samsonchoi/feishu-claude-bot/bot.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/samsonchoi/feishu-claude-bot/bot.error.log</string>
+
+    <!-- 环境变量（确保能找到 claude 命令）-->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:/Users/samsonchoi/.local/bin:/Users/samsonchoi/.npm-global/bin</string>
+        <key>HOME</key>
+        <string>/Users/samsonchoi</string>
+    </dict>
+</dict>
+</plist>
