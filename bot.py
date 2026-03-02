@@ -95,15 +95,19 @@ class ClaudeSession:
 
                 # 发送消息
                 os.write(self.master_fd, (text + "\n").encode())
+                log.info(f"已发送消息到 Claude: {text[:50]}")
 
                 # 等待 Claude 开始处理
                 time.sleep(1)
 
                 # 读取响应，给予更长的超时时间
                 output = self._read_output(timeout=TIMEOUT)
+                log.info(f"原始输出长度: {len(output)} 字符")
+                log.debug(f"原始输出内容: {repr(output[:500])}")
 
                 # 清理输出
                 output = self._clean_output(output)
+                log.info(f"清理后输出长度: {len(output)} 字符")
 
                 if len(output) > MAX_OUTPUT_LEN:
                     output = output[:MAX_OUTPUT_LEN] + f"\n\n⚠️ 输出过长，已截断（共{len(output)}字符）"
@@ -123,7 +127,7 @@ class ClaudeSession:
                 return result
 
             except Exception as e:
-                log.error(f"发送消息失败: {e}")
+                log.error(f"发送消息失败: {e}", exc_info=True)
                 return f"❌ 执行出错：{str(e)}"
 
     def _read_output(self, timeout=30) -> str:
