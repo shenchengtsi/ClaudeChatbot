@@ -15,8 +15,10 @@ import sys
 import time
 import pty
 import select
+import pickle
 from datetime import datetime
 from collections import defaultdict
+from pathlib import Path
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import *
@@ -41,15 +43,20 @@ feishu_client = lark.Client.builder() \
     .app_secret(APP_SECRET) \
     .build()
 
+# ========== 会话持久化目录 ==========
+SESSIONS_DIR = Path("sessions")
+SESSIONS_DIR.mkdir(exist_ok=True)
+
 # ========== Session 管理 ==========
 class ClaudeSession:
     """管理单个 Claude Code 交互式会话"""
-    def __init__(self, chat_id: str):
+    def __init__(self, chat_id: str, restore_history=None):
         self.chat_id = chat_id
         self.process = None
         self.master_fd = None
         self.last_activity = time.time()
         self.lock = threading.Lock()
+        self.history = restore_history if restore_history else []  # 对话历史
         self.start_session()
 
     def start_session(self):
@@ -101,7 +108,19 @@ class ClaudeSession:
                 if len(output) > MAX_OUTPUT_LEN:
                     output = output[:MAX_OUTPUT_LEN] + f"\n\n⚠️ 输出过长，已截断（共{len(output)}字符）"
 
-                return output if output else "（命令执行完成，无输出）"
+                result = output if output else "（命令执行完成，无输出）"
+
+                # 保存到历史记录
+                self.history.append({
+                    "timestamp": datetime.now().isoformat(),
+                    "user": text,
+                    "assistant": result
+                })
+
+                # 持久化历史记录
+                self._save_history()
+
+                return result
 
             except Exception as e:
                 log.error(f"发送消息失败: {e}")
@@ -168,6 +187,49 @@ class ClaudeSession:
 
         return result
 
+    def _save_history(self):
+        """保存对话历史到文件"""
+        try:
+            history_file = SESSIONS_DIR / f"{self.chat_id}.json"
+            with open(history_file, 'w', encoding='utf-8') as f:
+                json.dump({
+                    "chat_id": self.chat_id,
+                    "last_activity": self.last_activity,
+                    "history": self.history
+                }, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log.error(f"保存历史失败: {e}")
+
+    @staticmethod
+    def load_history(chat_id: str):
+        """从文件加载对话历史"""
+        try:
+            history_file = SESSIONS_DIR / f"{chat_id}.json"
+            if history_file.exists():
+                with open(history_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    log.info(f"为 chat_id={chat_id} 加载了 {len(data['history'])} 条历史记录")
+                    return data['history']
+        except Exception as e:
+            log.error(f"加载历史失败: {e}")
+        return None
+
+    def get_history_summary(self) -> str:
+        """获取历史记录摘要"""
+        if not self.history:
+            return "暂无对话历史"
+
+        total = len(self.history)
+        first_time = self.history[0]['timestamp']
+        last_time = self.history[-1]['timestamp']
+
+        return f"📊 对话历史统计\n" \
+               f"━━━━━━━━━━━━━━━\n" \
+               f"💬 总对话数：{total}\n" \
+               f"🕐 首次对话：{first_time}\n" \
+               f"🕐 最近对话：{last_time}\n" \
+               f"📁 存储位置：sessions/{self.chat_id}.json"
+
     def close(self):
         """关闭会话"""
         try:
@@ -200,7 +262,9 @@ class SessionManager:
             if chat_id not in self.sessions or not self.sessions[chat_id].is_alive():
                 if chat_id in self.sessions:
                     self.sessions[chat_id].close()
-                self.sessions[chat_id] = ClaudeSession(chat_id)
+                # 尝试加载历史记录
+                history = ClaudeSession.load_history(chat_id)
+                self.sessions[chat_id] = ClaudeSession(chat_id, restore_history=history)
             return self.sessions[chat_id]
 
     def close_session(self, chat_id: str):
@@ -377,7 +441,17 @@ def handle_message_event(data):
 
         if text in ["/reset", "重置会话"]:
             session_manager.close_session(chat_id)
-            send_message(chat_id, "✅ 会话已重置，下次对话将创建新的 session")
+            # 删除历史文件
+            history_file = SESSIONS_DIR / f"{chat_id}.json"
+            if history_file.exists():
+                history_file.unlink()
+            send_message(chat_id, "✅ 会话已重置，对话历史已清空")
+            return
+
+        if text in ["/history", "历史", "查看历史"]:
+            session = session_manager.get_session(chat_id)
+            summary = session.get_history_summary()
+            send_message(chat_id, summary)
             return
 
         # 添加思考表情表示已读
@@ -430,12 +504,14 @@ HELP_TEXT = """
 
 📌 直接发送任何指令，Claude Code 会在你的 Mac Mini 上执行
 💡 每个聊天（私聊/群聊）都有独立的对话上下文
+💾 对话历史会自动保存，Bot 重启后可恢复
 
 📋 内置命令：
   /help      - 显示此帮助
   /pwd       - 查看当前工作目录
   /cd <路径> - 切换工作目录
   /status    - 查看 Bot 状态
+  /history   - 查看对话历史统计
   /reset     - 重置当前会话（清除对话历史）
 
 💡 示例指令：
@@ -448,7 +524,8 @@ HELP_TEXT = """
   - 所有操作都在 Mac Mini 本地执行
   - 每个聊天有独立的 Claude Code 会话
   - 会话会记住之前的对话内容
-  - 30分钟无活动会自动清理会话
+  - 对话历史保存在 sessions/ 目录
+  - 30分钟无活动会自动清理会话（历史保留）
 """.strip()
 
 
