@@ -14,6 +14,8 @@ import signal
 import sys
 import time
 import re
+import pty
+import select
 import pexpect
 from datetime import datetime
 from collections import defaultdict
