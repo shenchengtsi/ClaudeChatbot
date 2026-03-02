@@ -89,8 +89,10 @@ class ClaudeSession:
                 # 发送消息
                 os.write(self.master_fd, (text + "\n").encode())
 
-                # 读取响应
-                time.sleep(0.5)
+                # 等待 Claude 开始处理
+                time.sleep(1)
+
+                # 读取响应，给予更长的超时时间
                 output = self._read_output(timeout=TIMEOUT)
 
                 # 清理输出
@@ -109,6 +111,8 @@ class ClaudeSession:
         """读取 Claude Code 输出"""
         output = []
         start_time = time.time()
+        last_data_time = start_time
+        idle_threshold = 3  # 3秒无新数据则认为完成
 
         while time.time() - start_time < timeout:
             if select.select([self.master_fd], [], [], 0.1)[0]:
@@ -116,11 +120,12 @@ class ClaudeSession:
                     data = os.read(self.master_fd, 4096).decode('utf-8', errors='ignore')
                     if data:
                         output.append(data)
+                        last_data_time = time.time()
                 except OSError:
                     break
             else:
-                # 如果已经有输出且停止接收，认为完成
-                if output and time.time() - start_time > 1:
+                # 如果已经有输出且超过idle_threshold秒没有新数据，认为完成
+                if output and (time.time() - last_data_time) > idle_threshold:
                     break
 
         return ''.join(output)
@@ -128,24 +133,40 @@ class ClaudeSession:
     def _clean_output(self, text: str) -> str:
         """清理输出文本"""
         import re
+
         # 移除 ANSI 控制字符
         ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
         text = ansi_escape.sub('', text)
 
-        # 移除输入回显
+        # 移除其他控制字符
+        text = re.sub(r'[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]', '', text)
+
         lines = text.split('\n')
         cleaned_lines = []
-        skip_next = False
 
-        for line in lines:
-            if skip_next:
-                skip_next = False
-                continue
-            # 跳过空行和提示符
-            if line.strip() and not line.strip().startswith('>'):
-                cleaned_lines.append(line)
+        # 跳过开头的空行和回显
+        start_index = 0
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            # 找到第一行有实际内容的行
+            if stripped and not stripped.startswith('>') and len(stripped) > 2:
+                start_index = i
+                break
 
-        return '\n'.join(cleaned_lines).strip()
+        # 从有效内容开始收集
+        for line in lines[start_index:]:
+            stripped = line.strip()
+            # 保留有内容的行，跳过提示符
+            if stripped and not stripped.startswith('>'):
+                cleaned_lines.append(line.rstrip())
+
+        result = '\n'.join(cleaned_lines).strip()
+
+        # 如果结果太短或只有特殊字符，可能是没有实际输出
+        if len(result) < 5 or not any(c.isalnum() for c in result):
+            return ""
+
+        return result
 
     def close(self):
         """关闭会话"""
